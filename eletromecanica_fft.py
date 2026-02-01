@@ -1,62 +1,73 @@
-import time
+import json
 import numpy as np
-from scipy.fft import fft
+import matplotlib.pyplot as plt
+import paho.mqtt.client as mqtt
+from collections import deque
 
-FS = 1000            
-DURACAO = 5          
-RPM_BASE = 300       
-VARIACAO_RPM = 25    
+BROKER = "broker.hivemq.com"
+PORT = 1883
+TOPIC = "eletromecanica/motor/sensores"
 
-def gerar_vibracao_mock():
+FS = 200             
+N = 256               
+EIXO = "az"        
 
-    rpm_atual = RPM_BASE + np.random.uniform(-VARIACAO_RPM, VARIACAO_RPM)
-    freq_1x = rpm_atual / 60  
+ALERTA_G = 200
+CRITICO_G = 400
 
-    t = np.linspace(0, DURACAO, FS * DURACAO, endpoint=False)
+buffer = deque(maxlen=N)
 
-    signal = 0.8 * np.sin(2 * np.pi * freq_1x * t)
+def on_message(client, userdata, msg):
+    global buffer
 
-    signal += 0.3 * np.sin(2 * np.pi * 2 * freq_1x * t)
+    try:
+        data = json.loads(msg.payload.decode())
+        acc = data[EIXO]
+        buffer.append(acc)
 
-    signal += 0.2 * np.random.randn(len(t))
+        if len(buffer) == N:
+            processar_fft(np.array(buffer))
+            buffer.clear()
 
-    return signal, FS, rpm_atual
+    except Exception as e:
+        print("Erro:", e)
 
-def analisar_fft(signal, fs):
+def processar_fft(signal):
+    signal = signal - np.mean(signal)
 
-    N = len(signal)
-    NFFT = 4 * N              
-    
-    yf = np.abs(fft(signal, NFFT))
-    freqs = np.fft.fftfreq(NFFT, 1 / fs)
+    fft_vals = np.fft.fft(signal)
+    fft_mag = np.abs(fft_vals)[:N//2]
 
-    idx = np.argmax(yf[:NFFT // 2])
-    pico_freq = freqs[idx]
+    freqs = np.fft.fftfreq(N, 1/FS)[:N//2]
 
-    if pico_freq < 10:
-        falha = "DESBALANCEAMENTO"
-    elif pico_freq < 60:
-        falha = "DESALINHAMENTO"
-    else:
-        falha = "ROLAMENTO"
+    pico = np.max(fft_mag)
+    freq_pico = freqs[np.argmax(fft_mag)]
 
-    return float(round(pico_freq, 2)), falha
+    status = "NORMAL"
+    if pico > CRITICO_G:
+        status = "CRÍTICO"
+    elif pico > ALERTA_G:
+        status = "ALERTA"
 
-def main():
-    print("Pressione CTRL+C para parar\n")
+    print(f"\n📈 Pico: {pico:.1f} | Frequência: {freq_pico:.2f} Hz | Status: {status}")
 
-    while True:
-        signal, fs, rpm = gerar_vibracao_mock()
+    plotar(freqs, fft_mag, freq_pico, status)
 
-        pico, falha = analisar_fft(signal, fs)
+def plotar(freqs, mag, freq_pico, status):
+    plt.clf()
+    plt.plot(freqs, mag)
+    plt.title(f"Espectro de Vibração ({status})")
+    plt.xlabel("Frequência (Hz)")
+    plt.ylabel("Magnitude")
+    plt.axvline(freq_pico, linestyle="--")
+    plt.grid()
+    plt.pause(0.01)
 
-        print(
-            f"RPM: {rpm:6.1f} | "
-            f"Pico FFT: {pico:5.2f} Hz | "
-            f"Falha: {falha}"
-        )
+client = mqtt.Client()
+client.on_message = on_message
+client.connect(BROKER, PORT)
+client.subscribe(TOPIC)
 
-        time.sleep(2)
-
-if __name__ == "__main__":
-    main()
+print("📡 Aguardando dados MQTT...")
+plt.figure(figsize=(10,5))
+client.loop_forever()
